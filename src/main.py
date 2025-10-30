@@ -2,15 +2,13 @@
 #src/main.py
 
 try:
-    from flask import Flask, request, g, jsonify, redirect, url_for, render_template_string
+    from flask import Flask,request,g,jsonify,render_template_string
+    from html.parser import HTMLParser
+    from datetime import datetime
     import sqlite3
     import urllib.request
     import urllib.parse
-    import urllib.error
-    from html.parser import HTMLParser
-    import time
     import re
-    from datetime import datetime
 except Exception as e:
     print("无法导入全部库",e)
 
@@ -286,8 +284,6 @@ input[type=text]{padding:8px 10px;border-radius:6px;border:1px solid rgba(0,0,0,
     <button class="button" type="submit">提交并抓取</button>
     <span id="msg"></span>
   </form>
-
-  <a href="https://github.com/xhdndmm/one_file_search_engine">源代码</a>
 </div>
 
 <div class="container">
@@ -311,6 +307,8 @@ input[type=text]{padding:8px 10px;border-radius:6px;border:1px solid rgba(0,0,0,
         <li>在导航栏的输入框输入关键词回车或点击“搜索”。</li>
         <li>在右侧输入完整的网址（包含 http(s)://），点击“提交并抓取”将把该站点的 title、meta keywords、description 及页面文本摘录存入数据库。</li>
         <li>本示例不抓取媒体文件（图片/视频/pdf 等），并限制抓取大小以防止资源占用。</li>
+        <br>
+        <a href="https://github.com/xhdndmm/one_file_search_engine">源代码</a>
       </ul>
     </div>
   {% endif %}
@@ -386,6 +384,6 @@ def submit():
 # 启动
 # -----------------------
 if __name__ == "__main__":
-    print("one_file_search_engine v1.0-beta")
+    print("one_file_search_engine v1.0")
     init_db()
-    app.run(host='0.0.0.0', port=5000, threaded=True,debug=True)
+    app.run(host='0.0.0.0', port=5000, threaded=True,debug=False)
