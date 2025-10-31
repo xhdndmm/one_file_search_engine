@@ -9,12 +9,23 @@
 使用Python编写，SQLite数据库，Flask Web服务，支持爬取网页，记录网页信息，并根据关键信息搜索的功能。
 
 ## 如何安装并使用？
+### 手动部署
 准备[Python3](https://www.python.org/downloads/release/python-3128/)环境  
 克隆存储库并安装依赖：
 ```shell
 git clone https://github.com/xhdndmm/one_file_search_engine && cd one_file_search_engine && pip install -r requirements.txt
 ```
 - 注：旧版本可以在[这里](https://github.com/xhdndmm/one_file_search_engine/releases)下载  
+### Docker部署
+安装好docker后：
+```shell
+docker build -t one_file_search_engine .
+docker run -d one_file_search_engine
+```
+或者
+```shell
+docker-compose up -d
+```
 
 启动程序：
 ```shell

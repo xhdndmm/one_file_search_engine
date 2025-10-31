@@ -1,0 +1,11 @@
+services:
+  search-engine:
+    build: .
+    container_name: one_file_search_engine
+    ports:
+      - "5000:5000"
+    volumes:
+        - ./:/app
+    environment:
+      - FLASK_ENV=production
+    restart: unless-stopped
