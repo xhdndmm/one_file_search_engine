@@ -1,7 +1,7 @@
 #python3
 #src/main.py
 
-from flask import Flask, request, g, jsonify, render_template_string
+from flask import Flask, request, g, jsonify, render_template_string, redirect, url_for, session
 from html.parser import HTMLParser
 from datetime import datetime
 import sqlite3
@@ -11,16 +11,69 @@ import re
 import time
 import threading
 import socket
+import json
+import os
+import ipaddress
+import secrets
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# 常量配置
-DB_PATH = "sites.db"
-MAX_FETCH_BYTES = 200 * 1024  # 最多读取 200KB 页面
-FETCH_TIMEOUT = 8  # 秒
-ALLOWED_SCHEMES = ('http', 'https')
-USER_AGENT = "Mozilla/5.0 (compatible; one_file_search_engine_bot/1.0; +https://github.com/xhdndmm/one_file_search_engine)"
-ROBOTS_CACHE_TTL = 3600  # robots 缓存秒数
+# -----------------------
+# 配置文件与常量
+# -----------------------
+DEFAULT_CONFIG = {
+    "db_path": "sites.db",
+    "max_fetch_bytes": 200 * 1024,
+    "fetch_timeout": 8,
+    "allowed_schemes": ["http", "https"],
+    "user_agent": "Mozilla/5.0 (compatible; one_file_search_engine_bot/1.0; +https://github.com/xhdndmm/one_file_search_engine)",
+    "robots_cache_ttl": 3600,
+    "admin_user": "admin",
+    "admin_password_hash": None,
+    "secret_key": None,
+    "disallow_private_networks": True
+}
+CONFIG_PATH = "config.json"
+
+def load_config():
+    cfg = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                user_cfg = json.load(f)
+            cfg.update(user_cfg)
+        except Exception as e:
+            print("读取 config.json 失败，使用默认配置。错误：", e)
+    else:
+        # 生成默认并保存（包括随机 secret_key 和默认 admin password hash）
+        cfg["secret_key"] = secrets.token_hex(32)
+        # 生成 hash for default 'admin' password
+        cfg["admin_password_hash"] = generate_password_hash("admin")
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            print(f"已生成默认 {CONFIG_PATH}")
+        except Exception as e:
+            print("无法写入默认 config.json：", e)
+    # 填补 secret / password hash
+    if not cfg.get("secret_key"):
+        cfg["secret_key"] = secrets.token_hex(32)
+    if not cfg.get("admin_password_hash"):
+        cfg["admin_password_hash"] = generate_password_hash("admin")
+    return cfg
+
+cfg = load_config()
+
+DB_PATH = cfg.get("db_path", "sites.db")
+MAX_FETCH_BYTES = cfg.get("max_fetch_bytes", 200 * 1024)
+FETCH_TIMEOUT = cfg.get("fetch_timeout", 8)
+ALLOWED_SCHEMES = tuple(cfg.get("allowed_schemes", ["http", "https"]))
+USER_AGENT = cfg.get("user_agent", DEFAULT_CONFIG["user_agent"])
+ROBOTS_CACHE_TTL = cfg.get("robots_cache_ttl", 3600)
+DISALLOW_PRIVATE = cfg.get("disallow_private_networks", True)
 
 app = Flask(__name__)
+app.secret_key = cfg.get("secret_key") or secrets.token_hex(32)
 
 # -----------------------
 # 数据库与连接
@@ -30,7 +83,6 @@ def get_db():
     if db is None:
         db = g._db = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
         db.row_factory = sqlite3.Row
-        # 启用 WAL 模式（提高并发写入性能）
         try:
             db.execute("PRAGMA journal_mode=WAL;")
             db.execute("PRAGMA synchronous = NORMAL;")
@@ -41,8 +93,6 @@ def get_db():
 def init_db():
     db = sqlite3.connect(DB_PATH)
     c = db.cursor()
-
-    # 主表
     c.execute("""
     CREATE TABLE IF NOT EXISTS sites (
         id INTEGER PRIMARY KEY,
@@ -54,9 +104,6 @@ def init_db():
         crawled_at TEXT
     )
     """)
-
-    # FTS5 全文表（content=sites，使用 rowid 链接）
-    # 如果你的 sqlite 没有 FTS5，这句会抛错 -> 你需要安装支持 FTS5 的 sqlite
     try:
         c.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS sites_fts USING fts5(
@@ -65,10 +112,7 @@ def init_db():
         );
         """)
     except Exception as e:
-        # 如果 FTS5 无法创建，打印警告但不阻止服务（运行时会回退）
         print("警告：创建 FTS5 失败（你的 SQLite 可能不支持 FTS5）。会使用回退搜索策略。错误:", e)
-
-    # 爬取队列和日志
     c.execute("""
     CREATE TABLE IF NOT EXISTS crawl_queue (
         id INTEGER PRIMARY KEY,
@@ -156,10 +200,6 @@ robots_lock = threading.Lock()
 robots_cache = {}  # host -> (fetched_at, rules)
 
 def _parse_robots_text(txt, agent_name):
-    """
-    返回 dict: {'disallow': [paths], 'delay': float}
-    简单实现：仅处理 User-agent, Disallow, Crawl-delay
-    """
     lines = txt.splitlines()
     current_agents = []
     rules = {'disallow': [], 'delay': 0}
@@ -177,7 +217,6 @@ def _parse_robots_text(txt, agent_name):
         elif k == 'disallow':
             if not current_agents:
                 continue
-            # apply only if agent matches '*' or our agent
             for a in current_agents:
                 if a == '*' or a.lower() in agent_name.lower():
                     rules['disallow'].append(v or '/')
@@ -192,17 +231,12 @@ def _parse_robots_text(txt, agent_name):
     return rules
 
 def fetch_robots(host, scheme='https'):
-    """
-    返回 rules dict
-    缓存一定时间，异常时返回空规则
-    """
     key = (scheme, host)
     now = time.time()
     with robots_lock:
         entry = robots_cache.get(key)
         if entry and now - entry['fetched_at'] < ROBOTS_CACHE_TTL:
             return entry['rules']
-    # fetch
     robots_url = f"{scheme}://{host}/robots.txt"
     rules = {'disallow': [], 'delay': 0}
     try:
@@ -211,7 +245,6 @@ def fetch_robots(host, scheme='https'):
             raw = resp.read(64*1024).decode('utf-8', errors='ignore')
             rules = _parse_robots_text(raw, USER_AGENT)
     except Exception:
-        # 尝试 http if https failed
         if scheme == 'https':
             return fetch_robots(host, scheme='http')
     with robots_lock:
@@ -224,13 +257,47 @@ def is_allowed_by_robots(url):
     scheme = p.scheme or 'https'
     rules = fetch_robots(host, scheme=scheme)
     path = p.path or '/'
-    # 简单 prefix 匹配
     for dis in rules.get('disallow', []):
         if dis == '/':
             return False, rules
         if path.startswith(dis):
             return False, rules
     return True, rules
+
+# -----------------------
+# SSRF 防护：拒绝私网 IP
+# -----------------------
+def host_is_private(hostname):
+    """
+    解析 hostname（域名或 IP），判断是否落入私有/回环范围
+    返回 True 表示为私有（应拒绝），False 表示公开
+    如果无法解析或出错，返回 True（更保守的策略）
+    """
+    try:
+        # strip possible port
+        if ':' in hostname:
+            hostname = hostname.split(':', 1)[0]
+        # If hostname is already IP
+        try:
+            ip = ipaddress.ip_address(hostname)
+            return ip.is_private or ip.is_loopback or ip.is_reserved
+        except ValueError:
+            pass
+        # resolve all addresses
+        infos = socket.getaddrinfo(hostname, None)
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr)
+                if ip.is_private or ip.is_loopback or ip.is_reserved:
+                    return True
+            except Exception:
+                # if parsing fails, be conservative
+                return True
+        return False
+    except Exception:
+        # 无法解析时更保守：认为私有/不可访问
+        return True
 
 # -----------------------
 # 抓取器（安全检查 + robots）
@@ -241,24 +308,33 @@ def is_media_url(url):
                  '.avi','.mov','.wmv','.flv','.mkv','.pdf','.zip','.rar')
     return any(lower.endswith(ext) for ext in media_ext)
 
+def validate_url_for_fetch(url):
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or parsed.scheme not in ALLOWED_SCHEMES:
+        raise ValueError("不允许的 URL scheme")
+    # 禁止本地回环或私有地址（SSRF 防护）
+    host = parsed.hostname or ''
+    if DISALLOW_PRIVATE and host:
+        if host_is_private(host):
+            raise ValueError("拒绝抓取私有或回环地址（为防止 SSRF）")
+    if is_media_url(parsed.path):
+        raise ValueError("看起来是媒体/二进制文件，跳过")
+    return True
+
 def crawl_url(url):
     """
     返回 dict: {url, title, keywords, description, snippet}
     可能抛出异常（由上层处理）
     """
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ALLOWED_SCHEMES:
-        raise ValueError("不允许的 URL scheme")
-    if is_media_url(parsed.path):
-        raise ValueError("看起来是媒体文件，跳过")
+    validate_url_for_fetch(url)
+
     allowed, rules = is_allowed_by_robots(url)
     if not allowed:
         raise ValueError("robots.txt 禁止抓取该路径")
 
-    # 如果 robots 指定了 crawl-delay，短暂 sleep（谨慎遵守）
     delay = rules.get('delay', 0)
     if delay and delay > 0:
-        # 最多等待 10 秒，避免过长阻塞
         time.sleep(min(delay, 10))
 
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -289,7 +365,6 @@ def crawl_url(url):
     except Exception as e:
         raise ValueError(f"抓取失败: {e}")
 
-    # 解析头部和正文
     headp = HeadMetaParser()
     try:
         headp.feed(text)
@@ -327,7 +402,6 @@ def upsert_site(info):
         """, (info['url'], info['title'], info.get('keywords',''),
               info.get('description',''), info.get('snippet',''), now))
         rowid = cur.lastrowid
-        # 同步到 FTS（如果存在）
         try:
             cur.execute("""
                 INSERT INTO sites_fts(rowid, url, title, keywords, description, snippet)
@@ -335,16 +409,13 @@ def upsert_site(info):
             """, (rowid, info['url'], info['title'], info.get('keywords',''),
                   info.get('description',''), info.get('snippet','')))
         except sqlite3.OperationalError:
-            # 可能没有 FTS5 支持，忽略
             pass
     except sqlite3.IntegrityError:
-        # 已存在 -> update
         cur.execute("""
             UPDATE sites SET title=?, keywords=?, description=?, snippet=?, crawled_at=?
             WHERE url=?
         """, (info['title'], info.get('keywords',''), info.get('description',''),
               info.get('snippet',''), now, info['url']))
-        # 更新 FTS：删除并插入新的 row
         try:
             rowid = cur.execute("SELECT id FROM sites WHERE url=?", (info['url'],)).fetchone()[0]
             cur.execute("DELETE FROM sites_fts WHERE rowid=?", (rowid,))
@@ -363,11 +434,9 @@ def upsert_site(info):
 def _fts_available(db):
     try:
         db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sites_fts'").fetchone()
-        # 尝试 bm25 调用以确认是否可用（不抛出）
         try:
             db.execute("SELECT bm25(sites_fts) FROM sites_fts LIMIT 0")
         except Exception:
-            # 即使 bm25 不可用，FTS5 可能仍能用 MATCH
             pass
         return True
     except Exception:
@@ -378,13 +447,10 @@ def search_sites(query, limit=50):
     if not q_raw:
         return []
     db = get_db()
-    # 将空白分词，构建 FTS 前缀查询（如 "foo bar" -> "foo* bar*"）
     terms = [t for t in re.split(r'\s+', q_raw) if t]
-    fts_query = " ".join(t + "*" for t in terms)  # 前缀匹配
+    fts_query = " ".join(t + "*" for t in terms)
     res = []
-    # 优先使用 FTS5 MATCH
     try:
-        # 使用 bm25 排序（越小越相关，故 ASC）
         sql = """
             SELECT s.url, s.title, s.keywords, s.description, s.snippet, s.crawled_at,
                    bm25(sites_fts) AS score
@@ -407,9 +473,7 @@ def search_sites(query, limit=50):
             })
         if res:
             return res
-    except sqlite3.OperationalError as e:
-        # 可能没有 bm25 或 FTS5 支持 -> 回退到更兼容的查询
-        # 回退策略：使用 MATCH 获取候选（不使用 bm25），然后 Python 侧评分排序
+    except sqlite3.OperationalError:
         try:
             rows = db.execute("""
                 SELECT s.url, s.title, s.keywords, s.description, s.snippet, s.crawled_at, s.id
@@ -418,7 +482,6 @@ def search_sites(query, limit=50):
                 WHERE sites_fts MATCH ?
                 LIMIT 500
             """, (fts_query,)).fetchall()
-            # Python 评分（尽量在候选集中进行）
             candidates = []
             lowq = q_raw.lower()
             qtoks = terms
@@ -456,12 +519,7 @@ def search_sites(query, limit=50):
             if res:
                 return res
         except Exception:
-            # 如果连 MATCH 都不行（例如没有 FTS5），回退到全表筛选（尽量减少开销）
             pass
-    except Exception:
-        pass
-
-    # 最后回退：没有 FTS5 的情况下，做受限的全表扫描（limit 500），但只选出包含任一查询词的行
     rows = db.execute("SELECT * FROM sites LIMIT 1000").fetchall()
     final = []
     qtoks = [t.lower() for t in terms]
@@ -506,7 +564,6 @@ def rebuild_fts():
     cur = db.cursor()
     try:
         cur.execute("DELETE FROM sites_fts;")
-        # 将 sites 中全量导入 sites_fts
         rows = cur.execute("SELECT id, url, title, keywords, description, snippet FROM sites").fetchall()
         for r in rows:
             try:
@@ -522,7 +579,18 @@ def rebuild_fts():
         return False, str(e)
 
 # -----------------------
-# 路由与前端（保留原 UI，添加 reindex/queue）
+# 管理认证（session）
+# -----------------------
+def admin_login_required(f):
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if session.get("admin_logged_in"):
+            return f(*args, **kwargs)
+        return redirect(url_for("admin_login", next=request.path))
+    return wrapped
+
+# -----------------------
+# 前端模板（保留原 UI），以及 Admin 模板
 # -----------------------
 TEMPLATE = """
 <!doctype html>
@@ -586,15 +654,6 @@ input[type=text]{padding:8px 10px;border-radius:6px;border:1px solid rgba(0,0,0,
       </ul>
     </div>
   {% endif %}
-  <div class="card">
-    <h4>管理</h4>
-    <div style="display:flex;gap:8px">
-      <button onclick="reindex()" class="button">重建索引（/reindex）</button>
-      <button onclick="viewQueue()" class="button">查看队列（/queue）</button>
-    </div>
-    <div id="adminMsg" class="small" style="margin-top:8px;color:#666"></div>
-  </div>
-</div>
 
 <script>
 async function submitUrl(ev){
@@ -650,6 +709,98 @@ async function viewQueue(){
 </html>
 """
 
+ADMIN_LOGIN_TMPL = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Admin Login</title></head>
+<body>
+  <h2>管理面板登录</h2>
+  {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+  <form method="post">
+    <label>用户名: <input name="username" value="{{ username or '' }}"></label><br>
+    <label>密码: <input name="password" type="password"></label><br>
+    <button type="submit">登录</button>
+  </form>
+  <p><a href="/">返回首页</a></p>
+</body>
+</html>
+"""
+
+# 管理页面前端模板
+ADMIN_DASHBOARD_TMPL = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Admin Dashboard</title></head>
+<body>
+  <h2>管理面板</h2>
+  <p>欢迎，{{ user }}. <a href="{{ url_for('admin_logout') }}">登出</a></p>
+  <h3>统计</h3>
+  <ul>
+    <li>站点总数: {{ stats.sites_count }}</li>
+    <li>队列长度: {{ stats.queue_len }}</li>
+    <li>日志条数 (最近 50): {{ stats.logs_count }}</li>
+    <li>robots 缓存条目: {{ stats.robots_cache }}</li>
+  </ul>
+
+  <h3>操作</h3>
+  <form method="post" action="{{ url_for('admin_reindex') }}">
+    <button type="submit">重建 FTS 索引</button>
+  </form>
+
+  <h3>站点列表</h3>
+  <table border="1" cellpadding="6">
+    <tr><th>id</th><th>url</th><th>title</th><th>crawled_at</th><th>操作</th></tr>
+    {% for s in sites %}
+    <tr>
+      <td>{{ s.id }}</td>
+      <td><a href="{{ s.url }}" target="_blank">{{ s.url }}</a></td>
+      <td>{{ s.title }}</td>
+      <td>{{ s.crawled_at }}</td>
+      <td>
+        <form style="display:inline" method="post" action="{{ url_for('admin_recrawl') }}">
+          <input type="hidden" name="url" value="{{ s.url }}">
+          <button type="submit">重新抓取</button>
+        </form>
+        <form style="display:inline" method="post" action="{{ url_for('admin_delete_site') }}">
+          <input type="hidden" name="url" value="{{ s.url }}">
+          <button type="submit" onclick="return confirm('确认删除？')">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h3>抓取队列（最近 50）</h3>
+  <ul>
+    {% for q in queue %}
+      <li>{{ q.added_at }} - {{ q.url }}</li>
+    {% endfor %}
+  </ul>
+
+  <h3>抓取日志（最近 50）</h3>
+  <ul>
+    {% for l in logs %}
+      <li>{{ l.created_at }} - {{ l.status }} - {{ l.url }} - {{ l.detail }}</li>
+    {% endfor %}
+  </ul>
+
+  <h3>修改管理员密码</h3>
+  {% if pwd_msg %}<p style="color:green">{{ pwd_msg }}</p>{% endif %}
+  {% if pwd_err %}<p style="color:red">{{ pwd_err }}</p>{% endif %}
+  <form method="post" action="{{ url_for('admin_change_password') }}">
+    <label>当前密码: <input name="current_password" type="password"></label><br>
+    <label>新密码: <input name="new_password" type="password"></label><br>
+    <button type="submit">修改密码</button>
+  </form>
+
+  <p><a href="/">返回首页</a></p>
+</body>
+</html>
+"""
+
+# -----------------------
+# 路由：前端与提交
+# -----------------------
 @app.route("/", methods=["GET"])
 def index():
     q = request.args.get("q", "").strip()
@@ -658,6 +809,7 @@ def index():
     if q:
         results = search_sites(q)
         total = len(results)
+    # 为了代码块清晰，把原先的 TEMPLATE 直接使用（确保你把上面 TEMPLATE 恢复为原字符串）
     return render_template_string(TEMPLATE, q=q, results=results, total=total)
 
 @app.route("/submit", methods=["POST"])
@@ -666,13 +818,11 @@ def submit():
     url = (data.get("url") or "").strip()
     if not url:
         return jsonify({"ok": False, "error": "没有提供 URL"}), 400
-    # 确保带 scheme
     if not urllib.parse.urlparse(url).scheme:
         url = "http://" + url
     try:
         info = crawl_url(url)
     except Exception as e:
-        # 记录日志
         try:
             db = get_db()
             db.execute("INSERT INTO crawl_logs (url, status, detail, created_at) VALUES (?, ?, ?, ?)",
@@ -683,7 +833,6 @@ def submit():
         return jsonify({"ok": False, "error": str(e)}), 400
     try:
         upsert_site(info)
-        # log success
         db = get_db()
         db.execute("INSERT INTO crawl_logs (url, status, detail, created_at) VALUES (?, ?, ?, ?)",
                    (url, "ok", "", datetime.utcnow().isoformat()+"Z"))
@@ -692,14 +841,138 @@ def submit():
         return jsonify({"ok": False, "error": "数据库错误: %s" % e}), 500
     return jsonify({"ok": True, "url": info['url'], "title": info.get('title')})
 
-@app.route("/reindex", methods=["POST"])
-def reindex():
+# -----------------------
+# 管理面板路由
+# -----------------------
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    error = None
+    username = ""
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if username != cfg.get("admin_user"):
+            error = "用户名或密码错误"
+        else:
+            if check_password_hash(cfg.get("admin_password_hash",""), password):
+                session["admin_logged_in"] = True
+                session["admin_user"] = username
+                next_url = request.args.get("next") or url_for("admin_dashboard")
+                return redirect(next_url)
+            else:
+                error = "用户名或密码错误"
+    return render_template_string(ADMIN_LOGIN_TMPL, error=error, username=username)
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.pop("admin_logged_in", None)
+    session.pop("admin_user", None)
+    return redirect(url_for("index"))
+
+@app.route("/admin/dashboard", methods=["GET"])
+@admin_login_required
+def admin_dashboard():
+    db = get_db()
+    sites = db.execute("SELECT id, url, title, crawled_at FROM sites ORDER BY crawled_at DESC LIMIT 200").fetchall()
+    queue = db.execute("SELECT url, added_at FROM crawl_queue ORDER BY added_at DESC LIMIT 50").fetchall()
+    logs = db.execute("SELECT url, status, detail, created_at FROM crawl_logs ORDER BY created_at DESC LIMIT 50").fetchall()
+    stats = {
+        "sites_count": db.execute("SELECT COUNT(1) as c FROM sites").fetchone()["c"],
+        "queue_len": db.execute("SELECT COUNT(1) as c FROM crawl_queue").fetchone()["c"],
+        "logs_count": db.execute("SELECT COUNT(1) as c FROM crawl_logs").fetchone()["c"],
+        "robots_cache": len(robots_cache)
+    }
+    return render_template_string(ADMIN_DASHBOARD_TMPL, user=session.get("admin_user"), sites=sites, queue=queue, logs=logs, stats=stats, pwd_msg=None, pwd_err=None)
+
+@app.route("/admin/reindex", methods=["POST"])
+@admin_login_required
+def admin_reindex():
     ok, msg = rebuild_fts()
     if ok:
-        return jsonify({"ok": True, "msg": msg})
+        return redirect(url_for("admin_dashboard"))
     else:
         return jsonify({"ok": False, "error": msg}), 500
 
+@app.route("/admin/recrawl", methods=["POST"])
+@admin_login_required
+def admin_recrawl():
+    url = (request.form.get("url") or "").strip()
+    if not url:
+        return "没有提供 url", 400
+    try:
+        info = crawl_url(url)
+        upsert_site(info)
+        db = get_db()
+        db.execute("INSERT INTO crawl_logs (url, status, detail, created_at) VALUES (?, ?, ?, ?)",
+                   (url, "ok", "admin_recrawl", datetime.utcnow().isoformat()+"Z"))
+        db.commit()
+    except Exception as e:
+        db = get_db()
+        db.execute("INSERT INTO crawl_logs (url, status, detail, created_at) VALUES (?, ?, ?, ?)",
+                   (url, "error", str(e), datetime.utcnow().isoformat()+"Z"))
+        db.commit()
+    return redirect(url_for("admin_dashboard"))
+
+@app.route("/admin/delete_site", methods=["POST"])
+@admin_login_required
+def admin_delete_site():
+    url = (request.form.get("url") or "").strip()
+    if not url:
+        return "没有提供 url", 400
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute("DELETE FROM sites WHERE url=?", (url,))
+        try:
+            # 删除 fts 对应 row
+            cur.execute("DELETE FROM sites_fts WHERE url=?", (url,))
+        except Exception:
+            pass
+        db.commit()
+    except Exception as e:
+        return str(e), 500
+    return redirect(url_for("admin_dashboard"))
+
+@app.route("/admin/change_password", methods=["POST"])
+@admin_login_required
+def admin_change_password():
+    current = request.form.get("current_password") or ""
+    newpwd = request.form.get("new_password") or ""
+    pwd_msg = None
+    pwd_err = None
+    if not check_password_hash(cfg.get("admin_password_hash",""), current):
+        pwd_err = "当前密码不正确"
+    elif not newpwd or len(newpwd) < 4:
+        pwd_err = "新密码太短（至少 4 个字符）"
+    else:
+        # 更新 config.json 中的 hash
+        cfg["admin_password_hash"] = generate_password_hash(newpwd)
+        try:
+            # 尝试持久化到 config.json
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                curcfg = json.load(f)
+            curcfg.update(cfg)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(curcfg, f, indent=2)
+            pwd_msg = "密码已更新"
+        except Exception as e:
+            pwd_err = "无法写入 config.json: " + str(e)
+    # 重新渲染 dashboard 并显示消息
+    db = get_db()
+    sites = db.execute("SELECT id, url, title, crawled_at FROM sites ORDER BY crawled_at DESC LIMIT 200").fetchall()
+    queue = db.execute("SELECT url, added_at FROM crawl_queue ORDER BY added_at DESC LIMIT 50").fetchall()
+    logs = db.execute("SELECT url, status, detail, created_at FROM crawl_logs ORDER BY created_at DESC LIMIT 50").fetchall()
+    stats = {
+        "sites_count": db.execute("SELECT COUNT(1) as c FROM sites").fetchone()["c"],
+        "queue_len": db.execute("SELECT COUNT(1) as c FROM crawl_queue").fetchone()["c"],
+        "logs_count": db.execute("SELECT COUNT(1) as c FROM crawl_logs").fetchone()["c"],
+        "robots_cache": len(robots_cache)
+    }
+    return render_template_string(ADMIN_DASHBOARD_TMPL, user=session.get("admin_user"), sites=sites, queue=queue, logs=logs, stats=stats, pwd_msg=pwd_msg, pwd_err=pwd_err)
+
+# -----------------------
+# 队列接口（受保护的 POST，GET 可公开查看）
+# -----------------------
 @app.route("/queue", methods=["GET","POST"])
 def queue():
     db = get_db()
@@ -724,6 +997,6 @@ def queue():
 # 启动
 # -----------------------
 if __name__ == "__main__":
-    print("one_file_search_engine v1.0")
+    print("one_file_search_engine v1.1-admin")
     init_db()
     app.run(host='0.0.0.0', port=5000, threaded=True, debug=True)
