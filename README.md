@@ -1,7 +1,8 @@
 # One_File_Search_Engine
-- v1.0效果图  
-<img src="./屏幕截图_20251030_184240.png" width="600"><img>
-<img src="./屏幕截图_20251030_184415.png" width="600"><img>  
+- v1.1效果图  
+<img src="./doc/屏幕截图_20251030_184240.png" width="600"><img>
+<img src="./doc/屏幕截图_20251030_184415.png" width="600"><img>
+<img src="./doc/屏幕截图_20251102_072445.png" width="600"><img>    
 ![](https://skillicons.dev/icons?i=docker,flask,py,sqlite)
 
 ## 这是什么？
